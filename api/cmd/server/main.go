@@ -78,25 +78,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- apiServer.Run()
-	}()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
-	select {
-	case err := <-errCh:
-		if err != nil {
-			logger.Error("API server error", "error", err)
-		}
-	case <-quit:
-		logger.Info("Shutdown signal received, initiating graceful shutdown...")
-	}
-
-	if err := apiServer.Shutdown(); err != nil {
-		logger.Error("Server shutdown failed", "error", err)
+	if err := apiServer.Run(ctx); err != nil {
+		logger.Error("API server error", "error", err)
 		os.Exit(1)
 	}
 	logger.Info("Server shut down gracefully")

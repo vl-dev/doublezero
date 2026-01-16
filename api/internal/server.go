@@ -22,7 +22,6 @@ type ApiServer struct {
 	estimatedSupply map[string]float64 // date -> estimated supply
 	rpcClient       RpcClient
 	httpServer      *http.Server
-	shutdownCh      chan struct{}
 	logger          *slog.Logger
 	mu              sync.RWMutex
 	listenAddr      string
@@ -60,7 +59,6 @@ func NewApiServer(opts ...Option) (*ApiServer, error) {
 	s := &ApiServer{
 		totalSupply:     0,
 		estimatedSupply: make(map[string]float64),
-		shutdownCh:      make(chan struct{}),
 		logger:          slog.Default(),
 		listenAddr:      ":8080", // Default listen address
 	}
@@ -130,7 +128,16 @@ func (s *ApiServer) GetCirculatingSupply() (float64, error) {
 	return circulatingSupply, nil
 }
 
-func (s *ApiServer) Run() error {
+func (s *ApiServer) fetchTotalSupply(ctx context.Context) (float64, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	return s.rpcClient.GetTotalSupply(ctx)
+}
+
+func (s *ApiServer) Run(ctx context.Context) error {
+	if ctx == nil {
+		return fmt.Errorf("context is required")
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/2z/circulating-supply", s.handleGetCirculatingSupply)
 	mux.HandleFunc("/api/v1/2z/total-supply", s.handleGetTotalSupply)
@@ -140,45 +147,42 @@ func (s *ApiServer) Run() error {
 		Handler: mux,
 	}
 
-	// periodically fetch total supply from Solana RPC and update s.totalSupply
+	errCh := make(chan error, 1)
 	go func() {
-		ticker := time.NewTicker(1 * time.Hour)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				totalSupply, err := s.rpcClient.GetTotalSupply(ctx)
-				cancel()
-
-				if err != nil {
-					s.logger.Error("Error fetching total supply from RPC", "error", err)
-					continue
-				}
-				s.mu.Lock()
-				s.totalSupply = totalSupply
-				s.mu.Unlock()
-				s.logger.Info("Updated total supply", "supply", totalSupply)
-			case <-s.shutdownCh:
-				s.logger.Info("Stopping periodic total supply fetcher.")
-				return
-			}
+		s.logger.Info("API server starting", "address", s.httpServer.Addr)
+		err := s.httpServer.ListenAndServe()
+		if err != nil && err != http.ErrServerClosed {
+			errCh <- err
+			return
 		}
+		errCh <- nil
 	}()
 
-	s.logger.Info("API server starting", "address", s.httpServer.Addr)
-	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		return fmt.Errorf("could not listen on %s: %w", s.httpServer.Addr, err)
+	t := time.NewTicker(1 * time.Hour)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			s.logger.Debug("Fetching total supply from RPC")
+			totalSupply, err := s.fetchTotalSupply(ctx)
+			if err != nil {
+				s.logger.Error("Error fetching total supply from RPC", "error", err)
+				continue
+			}
+			s.mu.Lock()
+			s.totalSupply = totalSupply
+			s.mu.Unlock()
+			s.logger.Info("Updated total supply", "supply", totalSupply)
+		case <-ctx.Done():
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := s.httpServer.Shutdown(shutdownCtx)
+			cancel()
+			if err != nil && err != http.ErrServerClosed {
+				s.logger.Error("Error shutting down server", "error", err)
+			}
+			return err
+		case err := <-errCh:
+			return err
+		}
 	}
-	return nil
-}
-
-func (s *ApiServer) Shutdown() error {
-	s.logger.Info("Shutting down server...")
-	close(s.shutdownCh)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	return s.httpServer.Shutdown(ctx)
 }
