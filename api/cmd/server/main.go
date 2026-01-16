@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -78,25 +79,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- apiServer.Run()
-	}()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
-	select {
-	case err := <-errCh:
-		if err != nil {
-			logger.Error("API server error", "error", err)
-		}
-	case <-quit:
-		logger.Info("Shutdown signal received, initiating graceful shutdown...")
-	}
-
-	if err := apiServer.Shutdown(); err != nil {
-		logger.Error("Server shutdown failed", "error", err)
+	runErr := apiServer.Run(ctx)
+	if runErr != nil && runErr != http.ErrServerClosed && runErr != context.Canceled {
+		logger.Error("API server error", "error", runErr)
 		os.Exit(1)
 	}
 	logger.Info("Server shut down gracefully")
